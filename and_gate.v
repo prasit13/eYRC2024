@@ -6,3 +6,5 @@ module and_gate (
 assign out = a & b;     // Logic implementation
 
 endmodule
+
+//https://drive.google.com/file/d/1EiChQaZMEGZBmaT5yreB1NxnblHUaSuT/view?usp=sharing
