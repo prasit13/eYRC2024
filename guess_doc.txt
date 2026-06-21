@@ -1,0 +1,868 @@
+term: nix develop "github:librelane/librelane/leo/gf180mcu" --command librelane --version
+
+This enters the matched LibreLane environment (the leo/gf180mcu build that pairs with the gf180 PDK) and asks it to print its version — a tiny, fast check that LibreLane and its Python are healthy
+
+
+term: git clone https://github.com/wafer-space/gf180mcu.git gf180mcu --depth 1 --branch 1.6.6
+
+This downloads the compatible gf180 pdk from github
+
+Inside rtl/efpga/fabric change the LHQD1 from latch to flip-flop as below:
+
+module LHQD1 (input D, E, output reg Q, QN);
+    // gf180mcu has NO latch standard cells, so the original level-sensitive
+    // config latch cannot map. The bitstream is written once at reset then held
+    // static, so implement each config bit as an edge-triggered DFF that captures
+    // on the rising edge of its frame strobe E (FrameStrobe is driven
+    // synchronously by the config FSM, so it is glitch-free in practice). This is
+    // interface-preserving (no CLK port), so the whole fabric/assembly and the
+    // chip-level instantiation are unchanged, and it maps cleanly to gf180 DFFs.
+    always @(posedge E)
+    begin
+        Q  <= D;
+        QN <= ~D;
+    end
+endmodule
+
+
+Create a new work folder for tile hardening:
+term: cd /home/prasit/fabulous_self
+term: mkdir -p work/tiles/LUT4AB
+
+Now inside LUT4AB, create the file work/tiles/LUT4AB/config.yaml with exactly this content:
+
+DESIGN_NAME: LUT4AB
+VERILOG_FILES:
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/fabric/*.v"
+CLOCK_PORT: "UserCLK"
+CLOCK_PERIOD: 40
+
+
+Now run:
+
+term: cd /home/prasit/fabulous_self
+term:
+''' 
+
+nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+  librelane work/tiles/LUT4AB/config.yaml \
+  --pdk gf180mcuD --pdk-root /home/prasit/fabulous_self/gf180mcu --manual-pdk \
+  --design-dir /home/prasit/fabulous_self --run-tag lut4ab
+  
+'''
+
+
+
+This will give an error that the run got to Stage 36/37 — "Resizer Timing Optimizations (Post-CTS)". OpenROAD found 85 setup violations with a huge worst slack (WNS −150 ns) and tried to repair timing (insert/resize buffers in a loop) — and that loop ran out of memory and aborted (Signal 6 … out of memory).
+
+
+
+
+The root cause (the lesson): a config-static FPGA fabric has no meaningful timing — its config DFFs are clocked by write-once strobes and its switch matrix is full of combinational loops. So every timing-driven part of the flow misbehaves on it. That single fact causes three symptoms: the post-CTS resizer OOMs (what you hit), and the setup / max-slew / max-cap checkers fail at the end. Fix = don't run timing optimization, and don't gate on timing checks.
+
+add these lines to work/tiles/LUT4AB/config.yaml
+
+(keep your existing 4 lines; append these)
+
+
+# fabric is config-static -> its timing is meaningless:
+RUN_CTS: false                      # config "clocks" are write-once strobes; no clock tree
+RUN_POST_CTS_RESIZER_TIMING: false  # <-- this is the step that OOM'd; don't optimize fake timing
+ERROR_ON_SYNTH_CHECKS: false        # fabric is latch/mux/loop heavy; synth warnings are expected
+GRT_ALLOW_CONGESTION: true          # let routing proceed through dense fabric congestion
+
+
+add --skip for the timing checkers to your run command
+
+cd /home/prasit/fabulous_self
+nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+  librelane work/tiles/LUT4AB/config.yaml \
+  --pdk gf180mcuD --pdk-root /home/prasit/fabulous_self/gf180mcu --manual-pdk \
+  --design-dir /home/prasit/fabulous_self --run-tag lut4ab_v2 \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+
+
+
+
+
+
+
+
+
+Now similarly we need to harden other tiles by running the below commands:
+term:
+'''
+for T in CIO W_IO N_term_single S_term_single; do
+  mkdir -p work/tiles/$T
+  sed "s/^DESIGN_NAME:.*/DESIGN_NAME: $T/" work/tiles/LUT4AB/config.yaml > work/tiles/$T/config.yaml
+  echo "=================== HARDENING $T ==================="
+  nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+    librelane work/tiles/$T/config.yaml \
+    --pdk gf180mcuD --pdk-root /home/prasit/fabulous_self/gf180mcu --manual-pdk \
+    --design-dir /home/prasit/fabulous_self --run-tag ${T}_v1 \
+    --skip Checker.SetupViolations --skip Checker.HoldViolations \
+    --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+done
+'''
+
+
+It will give an error for N_term_single and S_term_single due to the fact that for a tiny, near-empty block, relative (auto) sizing makes a die that's too small/awkward to place. The fix is to give it a fixed, roomy die and low density.
+
+The fix — append a fixed die to the two terminator configs, then re-run them
+
+term:
+'''
+
+for T in N_term_single S_term_single; do
+  cat >> work/tiles/$T/config.yaml <<'EOF'
+# routing-only terminator: fixed roomy die + low density so placement can legalize
+FP_SIZING: absolute
+DIE_AREA:  [0, 0, 150, 150]
+CORE_AREA: [10, 10, 140, 140]
+PL_TARGET_DENSITY_PCT: 15
+EOF
+  echo "=================== RE-HARDENING $T ==================="
+  nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+    librelane work/tiles/$T/config.yaml \
+    --pdk gf180mcuD --pdk-root /home/prasit/fabulous_self/gf180mcu --manual-pdk \
+    --design-dir /home/prasit/fabulous_self --run-tag ${T}_v2 \
+    --skip Checker.SetupViolations --skip Checker.HoldViolations \
+    --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+done
+
+'''
+
+What it does: cat >> … <<'EOF' appends the four floorplan lines to each terminator's config (the file had no FP_SIZING/DIE_AREA before, so there's no conflict — the new absolute sizing simply takes over).
+Re-runs each terminator with a fresh --run-tag <tile>_v2.
+
+
+
+
+
+
+
+
+Now we need to create eFPGA_top macro abstract. Since we can't detailed-route the real fabric on 7.4 GB, we represent eFPGA_top as a sized hard-macro — three views:
+
+.lef = its footprint + every pin on the boundary, with the interior marked as a routing blockage (OBS). The chip router needs only this to place it and route to its pins.
+.gds = a placeholder box (the real fabric layout would go here on a big machine).
+.bb.v = a (* blackbox *) module so synthesis knows its ports without its innards.
+
+Make the LEF/black-box generator — create work/ip/efpga/make_efpga_macro.py:
+
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+#!/usr/bin/env python3
+# Build a sized ABSTRACT macro for eFPGA_top: LEF (footprint + boundary pins,
+# grid-snapped, interior obstructed) + a black-box Verilog.
+import re, sys, os
+SRC, OUT = sys.argv[1], sys.argv[2]
+W, H = 2716.69, 6144.52                 # fabric footprint (from the tile-grid stitch)
+os.makedirs(OUT, exist_ok=True)
+hdr = open(SRC).read(); hdr = hdr[hdr.find("module eFPGA_top"):]; hdr = hdr[:hdr.find(");")]
+ports, pins = [], []
+for line in hdr.splitlines():
+    m = re.match(r'\s*(input|output)\s*(\[\d+:0\])?\s*([A-Za-z_]\w*)\s*,?', line)
+    if not m: continue
+    d, w, base = m.group(1), m.group(2) or "", m.group(3)
+    ports.append((d, w, base))
+    rng = range(int(w[1:-3])+1) if w else [None]      # bus width from [N:0]
+    for i in rng: pins.append((f"{base}[{i}]" if i is not None else base, d.upper()))
+# black-box Verilog
+with open(f"{OUT}/eFPGA_top.bb.v","w") as f:
+    f.write("// Black-box of the eFPGA fabric for synthesis (real layout = the macro LEF/GDS).\n")
+    f.write("(* blackbox *)\nmodule eFPGA_top (\n")
+    f.write(",\n".join(f"  {d} {w}{n}".replace("  "," ").rstrip() for d,w,n in ports))
+    f.write("\n);\nendmodule\n")
+# LEF with grid-snapped boundary pins
+snap = lambda v: round(round(v/0.01)*0.01, 2)
+W2,H2 = snap(W),snap(H); per=2*(W2+H2); step=per/len(pins); PW=0.60
+def pos(t):
+    t%=per
+    if t<W2: return (t,0.0)
+    t-=W2
+    if t<H2: return (W2,t)
+    t-=H2
+    if t<W2: return (W2-t,H2)
+    return (0.0,t-W2)
+L=["VERSION 5.8 ;",'BUSBITCHARS "[]" ;',"MACRO eFPGA_top","  CLASS BLOCK ;","  ORIGIN 0 0 ;",
+   f"  SIZE {W2:.2f} BY {H2:.2f} ;","  SYMMETRY X Y R90 ;"]
+for i,(name,d) in enumerate(pins):
+    x,y=pos((i+0.5)*step); x=snap(min(max(x,1.0),W2-1.0)); y=snap(min(max(y,1.0),H2-1.0))
+    a,b,c,e=snap(x-PW/2),snap(y-PW/2),snap(x+PW/2),snap(y+PW/2)
+    L+=[f"  PIN {name}",f"    DIRECTION {d} ;","    USE SIGNAL ;","    PORT","      LAYER Metal3 ;",
+        f"      RECT {a:.2f} {b:.2f} {c:.2f} {e:.2f} ;","    END",f"  END {name}"]
+for lay in ["Metal1","Metal2"]:
+    L+=["  OBS",f"    LAYER {lay} ;",f"    RECT 2.00 2.00 {snap(W2-2):.2f} {snap(H2-2):.2f} ;","  END"]
+L+=["END eFPGA_top","END LIBRARY"]
+open(f"{OUT}/eFPGA_top.lef","w").write("\n".join(L)+"\n")
+print(f"pins={len(pins)} SIZE={W2}x{H2}")
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+
+Make the GDS generator — create work/ip/efpga/mkgds.py:
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+ly = pya.Layout(); ly.dbu = 0.001
+top = ly.create_cell("eFPGA_top")
+top.shapes(ly.layer(0, 0)).insert(pya.Box(0, 0, int(round(2716.69/ly.dbu)), int(round(6144.52/ly.dbu))))
+ly.write("work/ip/efpga/eFPGA_top.gds"); print("GDS written")
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+
+Run both:
+
+cd /home/prasit/fabulous_self
+term:
+'''
+
+python3 work/ip/efpga/make_efpga_macro.py \
+    cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/fabric/eFPGA_top.v \
+    work/ip/efpga
+nix develop "github:librelane/librelane/leo/gf180mcu" --command klayout -b -r work/ip/efpga/mkgds.py
+
+'''
+
+
+Verify we got all three:
+
+term:
+'''
+
+ls -l work/ip/efpga/eFPGA_top.lef work/ip/efpga/eFPGA_top.gds work/ip/efpga/eFPGA_top.bb.v
+grep -c "^  PIN " work/ip/efpga/eFPGA_top.lef     # expect 590
+
+'''
+
+We now have the "pre-hardened macro" stand-in.
+
+
+
+
+
+
+
+Now inside work/rtl_v/cv32e40x_clock_gate.v — create the clock gate:
+
+module cv32e40x_clock_gate #(parameter LIB = 0) (
+    input  logic clk_i, en_i, scan_cg_en_i, output logic clk_o
+);
+  gf180mcu_fd_sc_mcu7t5v0__icgtp_1 u_icg (.CLK(clk_i), .E(en_i), .TE(scan_cg_en_i), .Q(clk_o));
+endmodule
+
+
+
+Then inside work/src/cv32e40x_top.sv — create the CPU + coprocessor wrapper:
+
+
+module cv32e40x_top #(parameter int unsigned NUM_MHPMCOUNTERS = 1) (
+    input  logic        clk_i, rst_ni, fetch_enable_i,
+    input  logic [31:0] boot_addr_i, dm_halt_addr_i, mhartid_i,
+    output logic        instr_req_o,  input  logic instr_gnt_i, instr_rvalid_i,
+    output logic [31:0] instr_addr_o, input  logic [31:0] instr_rdata_i,
+    output logic        data_req_o,   input  logic data_gnt_i, data_rvalid_i,
+    output logic [31:0] data_addr_o,  output logic [3:0] data_be_o,
+    output logic        data_we_o,    output logic [31:0] data_wdata_o,
+    input  logic [31:0] data_rdata_i, output logic core_sleep_o
+);
+  cv32e40x_if_xif #(.X_NUM_RS(2), .X_MEM_WIDTH(32), .X_RFR_WIDTH(32), .X_RFW_WIDTH(32), .X_MISA('0)) ext_if();
+  cv32e40x_core #(.NUM_MHPMCOUNTERS(NUM_MHPMCOUNTERS)) core_i (
+      .clk_i(clk_i), .rst_ni(rst_ni), .scan_cg_en_i(1'b0),
+      .boot_addr_i(boot_addr_i), .dm_exception_addr_i('0), .dm_halt_addr_i(dm_halt_addr_i),
+      .mhartid_i(mhartid_i), .mimpid_patch_i('0), .mtvec_addr_i('0),
+      .instr_req_o(instr_req_o), .instr_gnt_i(instr_gnt_i), .instr_rvalid_i(instr_rvalid_i),
+      .instr_addr_o(instr_addr_o), .instr_memtype_o(), .instr_prot_o(), .instr_dbg_o(),
+      .instr_rdata_i(instr_rdata_i), .instr_err_i(1'b0),
+      .data_req_o(data_req_o), .data_gnt_i(data_gnt_i), .data_rvalid_i(data_rvalid_i),
+      .data_addr_o(data_addr_o), .data_be_o(data_be_o), .data_we_o(data_we_o),
+      .data_wdata_o(data_wdata_o), .data_memtype_o(), .data_prot_o(), .data_dbg_o(),
+      .data_err_i(1'b0), .data_atop_o(), .data_rdata_i(data_rdata_i), .data_exokay_i(1'b1),
+      .mcycle_o(), .time_i('0),
+      .xif_compressed_if(ext_if), .xif_issue_if(ext_if), .xif_commit_if(ext_if),
+      .xif_mem_if(ext_if), .xif_mem_result_if(ext_if), .xif_result_if(ext_if),
+      .irq_i({32{1'b0}}), .wu_wfe_i(1'b0),
+      .clic_irq_i('0), .clic_irq_id_i('0), .clic_irq_level_i('0), .clic_irq_priv_i('0), .clic_irq_shv_i('0),
+      .fencei_flush_req_o(), .fencei_flush_ack_i(1'b0),
+      .debug_req_i(1'b0), .debug_havereset_o(), .debug_running_o(), .debug_halted_o(),
+      .debug_pc_valid_o(), .debug_pc_o(),
+      .fetch_enable_i(fetch_enable_i), .core_sleep_o(core_sleep_o));
+  xif_copro #(.INPUT_BUFFER_DEPTH(1), .FORWARDING(1)) xif_copro_i (
+      .clk_i(clk_i), .rst_ni(rst_ni),
+      .xif_compressed_if(ext_if), .xif_issue_if(ext_if), .xif_commit_if(ext_if),
+      .xif_mem_if(ext_if), .xif_mem_result_if(ext_if), .xif_result_if(ext_if));
+endmodule
+
+
+
+
+
+
+
+
+Now create work/librelane/cv32e40x_top/config.yaml:
+
+DESIGN_NAME: cv32e40x_top
+USE_SLANG: true
+SLANG_ARGUMENTS: ["--keep-hierarchy", "--ignore-unknown-modules"]
+VERILOG_FILES:
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/include/cv32e40x_pkg.sv"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/*.sv"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/xif_copro_efpga.v"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/efpga_config_loader.v"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/efpga_bitstream_rom.v"
+  - "dir::work/rtl_v/cv32e40x_clock_gate.v"
+  - "dir::work/src/cv32e40x_top.sv"
+VERILOG_INCLUDE_DIRS:
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/include"
+CLOCK_PORT: "clk_i"
+CLOCK_PERIOD: 40
+FP_SIZING: absolute
+DIE_AREA:  [0, 0, 4250, 6320]
+CORE_AREA: [20, 20, 4230, 6300]
+PL_TARGET_DENSITY_PCT: 30
+RUN_POST_GPL_DESIGN_REPAIR: false
+GRT_ALLOW_CONGESTION: true
+MACROS:
+  eFPGA_top:
+    gds: ["dir::work/ip/efpga/eFPGA_top.gds"]
+    lef: ["dir::work/ip/efpga/eFPGA_top.lef"]
+    nl:  ["dir::work/ip/efpga/eFPGA_top.bb.v"]
+    instances:
+      "xif_copro_i.xif_copro_verilog_i.efpga_i": {location: [1450, 75], orientation: N}
+      
+      
+      
+      
+Here, MACROS.eFPGA_top is listed as a macro, NOT in VERILOG_FILES (we don't synthesize its innards; we place its LEF and route to its pins). The nl is the black-box.
+instances: gives the macro's exact hierarchical path (cv32e40x_top → xif_copro_i → xif_copro_verilog_i → efpga_i) and a fixed location. Every macro must be placed, or PDN generation errors.
+DIE_AREA [0,0,4250,6320] — the eFPGA macro is ~2717×6145 µm; we put it on the right (location [1450,75]) and leave the ~1400 µm left column for the CPU logic. RUN_POST_GPL_DESIGN_REPAIR: false is the same "don't insert un-legalizable buffers near a big macro" lesson from the stitch.
+
+
+Now run it:
+term:  cd /home/prasit/fabulous_self
+term:
+'''
+
+nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+  librelane work/librelane/cv32e40x_top/config.yaml \
+  --pdk gf180mcuD --pdk-root /home/prasit/fabulous_self/gf180mcu --manual-pdk \
+  --design-dir /home/prasit/fabulous_self --run-tag cv32e40x_top \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations \
+  --skip Checker.DisconnectedPins --skip Checker.PowerGridViolations \
+  --skip Checker.LVS --skip OpenROAD.IRDropReport \
+  --skip Magic.DRC --skip KLayout.DRC
+  
+'''
+
+
+
+
+
+After this inside runs/cv32e40x_top/final/gds/cv32e40x_top.gds, gds is created for cv32e40x_top. 
+
+
+
+
+
+
+Now we need to recreate the memory subsystem + SPI loader. 
+Inside work/src/ , create chip_mem.sv — unified on-chip memory (8× SRAM) with an OBI arbiter and a loader backdoor:
+
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+module chip_mem #(
+    parameter int unsigned BANKS = 2,
+    parameter int unsigned WORDS = BANKS * 512,
+    parameter int unsigned AW    = $clog2(WORDS)
+) (
+    input  logic clk_i, rst_ni,
+    input  logic instr_req_i, output logic instr_gnt_o, instr_rvalid_o,
+    input  logic [31:0] instr_addr_i, output logic [31:0] instr_rdata_o,
+    input  logic data_req_i, output logic data_gnt_o, data_rvalid_o,
+    input  logic [31:0] data_addr_i, input logic [3:0] data_be_i,
+    input  logic data_we_i, input logic [31:0] data_wdata_i, output logic [31:0] data_rdata_o,
+    input  logic load_en_i, input logic [AW-1:0] load_addr_i, input logic [31:0] load_wdata_i
+);
+  logic sel_data, acc, we; logic [AW-1:0] word_addr; logic [3:0] be; logic [31:0] wdata;
+  assign sel_data    = data_req_i;
+  assign acc         = (instr_req_i | data_req_i) & ~load_en_i;
+  assign data_gnt_o  = data_req_i  & ~load_en_i;
+  assign instr_gnt_o = instr_req_i & ~data_req_i & ~load_en_i;
+  always_comb begin
+    if (load_en_i)      begin word_addr=load_addr_i;          we=1'b1;       be=4'hF;       wdata=load_wdata_i; end
+    else if (sel_data)  begin word_addr=data_addr_i[AW+1:2];  we=data_we_i;  be=data_be_i;  wdata=data_wdata_i; end
+    else                begin word_addr=instr_addr_i[AW+1:2]; we=1'b0;       be=4'h0;       wdata=32'b0; end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) begin instr_rvalid_o<=1'b0; data_rvalid_o<=1'b0; end
+    else begin instr_rvalid_o<=instr_gnt_o; data_rvalid_o<=data_gnt_o & ~data_we_i; end
+  logic [BANKS-1:0] bank_ce; logic [8:0] bank_a; assign bank_a = word_addr[8:0];
+  logic [31:0] bank_q [BANKS]; logic [$clog2(BANKS>1?BANKS:2)-1:0] sel_bank_q;
+  generate if (BANKS==1) begin : g_one assign bank_ce[0]=1'b1; end
+    else begin : g_multi
+      logic [$clog2(BANKS)-1:0] sel_bank; assign sel_bank = word_addr[9 +: $clog2(BANKS)];
+      always_comb begin bank_ce='0; bank_ce[sel_bank]=1'b1; end
+      always_ff @(posedge clk_i) sel_bank_q <= sel_bank;
+    end endgenerate
+  genvar b,l;
+  generate for (b=0;b<BANKS;b++) begin : g_bank
+    for (l=0;l<4;l++) begin : g_lane
+      logic cen,gwen; logic [7:0] wen;
+      assign cen=~(acc & bank_ce[b]); assign gwen=~(we & be[l]); assign wen={8{~(we & be[l])}};
+      gf180mcu_fd_ip_sram__sram512x8m8wm1 u_sram (.CLK(clk_i),.CEN(cen),.GWEN(gwen),.WEN(wen),
+        .A(bank_a),.D(wdata[l*8 +: 8]),.Q(bank_q[b][l*8 +: 8]));
+    end end endgenerate
+  logic [31:0] rdata; generate if (BANKS==1) assign rdata=bank_q[0]; else assign rdata=bank_q[sel_bank_q]; endgenerate
+  assign instr_rdata_o=rdata; assign data_rdata_o=rdata;
+endmodule
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+
+Inside work/src/ , create spi_loader.sv — the SPI slave program loader:
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+module spi_loader #(parameter int unsigned AW = 10) (
+    input  logic clk_i, rst_ni, sclk_i, cs_n_i, mosi_i, output logic miso_o,
+    output logic load_en_o, output logic [AW-1:0] load_addr_o, output logic [31:0] load_wdata_o,
+    output logic load_done_o
+);
+  logic [2:0] sclk_s, cs_s, mosi_s;
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) begin sclk_s<='0; cs_s<=3'b111; mosi_s<='0; end
+    else begin sclk_s<={sclk_s[1:0],sclk_i}; cs_s<={cs_s[1:0],cs_n_i}; mosi_s<={mosi_s[1:0],mosi_i}; end
+  wire sclk_rise=(sclk_s[2:1]==2'b01), cs_active=~cs_s[2], cs_deassert=(cs_s[2:1]==2'b01);
+  logic [31:0] shreg; logic [4:0] bitcnt; logic [AW-1:0] waddr;
+  assign load_wdata_o=shreg; assign load_addr_o=waddr; assign miso_o=1'b0;
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) begin shreg<=32'b0; bitcnt<=5'd0; waddr<='0; load_en_o<=1'b0; load_done_o<=1'b0; end
+    else begin
+      load_en_o<=1'b0;
+      if (cs_active && sclk_rise) begin
+        shreg<={shreg[30:0],mosi_s[2]}; bitcnt<=bitcnt+5'd1;
+        if (bitcnt==5'd31) begin load_en_o<=1'b1; bitcnt<=5'd0; end
+      end
+      if (load_en_o) waddr<=waddr+1'b1;
+      if (cs_deassert) load_done_o<=1'b1;
+    end
+endmodule
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+
+chip_mem: 8 SRAM macros = two 512×32 words (4 KB). A priority arbiter gives the data port precedence and stalls the instruction port on a same-cycle clash (by withholding instr_gnt). The OBI timing is "grant now, data next cycle." The load_* backdoor lets the loader write memory while the CPU is held in reset.
+spi_loader: samples the async SPI pins in the core clock domain (2-flop synchronizers), shifts in 32-bit words MSB-first, writes each to the backdoor at an auto-incrementing address, and raises load_done when chip-select deasserts — which we'll use to release the CPU from reset. This is the "load the program over SPI instead of hardcoding it" mechanism.
+
+
+
+
+
+
+
+
+
+
+
+Create work/src/chip_core.sv:
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+// Full SoC user-logic: CPU+eFPGA (cv32e40x_top) + on-chip memory (chip_mem) +
+// SPI program loader (spi_loader). The CPU is held in reset until the loader
+// has streamed the program into SRAM (load_done).
+module chip_core #(
+    parameter int unsigned MEM_BANKS = 2,
+    parameter int unsigned MEM_AW    = $clog2(MEM_BANKS*512)
+) (
+    input  logic clk_i, rst_ni, fetch_enable_i,
+    input  logic [31:0] boot_addr_i,
+    input  logic spi_sclk_i, spi_cs_n_i, spi_mosi_i, output logic spi_miso_o,
+    output logic core_sleep_o
+);
+  logic load_en, load_done; logic [MEM_AW-1:0] load_addr; logic [31:0] load_wdata;
+  spi_loader #(.AW(MEM_AW)) u_loader (
+      .clk_i(clk_i), .rst_ni(rst_ni),
+      .sclk_i(spi_sclk_i), .cs_n_i(spi_cs_n_i), .mosi_i(spi_mosi_i), .miso_o(spi_miso_o),
+      .load_en_o(load_en), .load_addr_o(load_addr), .load_wdata_o(load_wdata), .load_done_o(load_done));
+  logic core_rst_n; assign core_rst_n = rst_ni & load_done;   // boot CPU after load
+  logic instr_req, instr_gnt, instr_rvalid; logic [31:0] instr_addr, instr_rdata;
+  logic data_req, data_gnt, data_rvalid, data_we; logic [31:0] data_addr, data_wdata, data_rdata; logic [3:0] data_be;
+  cv32e40x_top u_cpu (
+      .clk_i(clk_i), .rst_ni(core_rst_n), .fetch_enable_i(fetch_enable_i),
+      .boot_addr_i(boot_addr_i), .dm_halt_addr_i(32'h0), .mhartid_i(32'h0),
+      .instr_req_o(instr_req), .instr_gnt_i(instr_gnt), .instr_rvalid_i(instr_rvalid),
+      .instr_addr_o(instr_addr), .instr_rdata_i(instr_rdata),
+      .data_req_o(data_req), .data_gnt_i(data_gnt), .data_rvalid_i(data_rvalid),
+      .data_addr_o(data_addr), .data_be_o(data_be), .data_we_o(data_we),
+      .data_wdata_o(data_wdata), .data_rdata_i(data_rdata), .core_sleep_o(core_sleep_o));
+  chip_mem #(.BANKS(MEM_BANKS)) u_mem (
+      .clk_i(clk_i), .rst_ni(rst_ni),
+      .instr_req_i(instr_req), .instr_gnt_o(instr_gnt), .instr_rvalid_o(instr_rvalid),
+      .instr_addr_i(instr_addr), .instr_rdata_o(instr_rdata),
+      .data_req_i(data_req), .data_gnt_o(data_gnt), .data_rvalid_o(data_rvalid),
+      .data_addr_i(data_addr), .data_be_i(data_be), .data_we_i(data_we),
+      .data_wdata_i(data_wdata), .data_rdata_o(data_rdata),
+      .load_en_i(load_en), .load_addr_i(load_addr), .load_wdata_i(load_wdata));
+endmodule
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+
+Create work/librelane/chip_core/config.yaml:
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+DESIGN_NAME: chip_core
+USE_SLANG: true
+SLANG_ARGUMENTS: ["--keep-hierarchy", "--ignore-unknown-modules"]
+VERILOG_FILES:
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/include/cv32e40x_pkg.sv"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/*.sv"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/xif_copro_efpga.v"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/efpga_config_loader.v"
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/efpga_bitstream_rom.v"
+  - "dir::work/rtl_v/cv32e40x_clock_gate.v"
+  - "dir::work/src/cv32e40x_top.sv"
+  - "dir::work/src/chip_mem.sv"
+  - "dir::work/src/spi_loader.sv"
+  - "dir::work/src/chip_core.sv"
+VERILOG_INCLUDE_DIRS:
+  - "dir::cv32e40x_updated_with_coproc_working_verilog/rtl/include"
+CLOCK_PORT: "clk_i"
+CLOCK_PERIOD: 40
+FP_SIZING: absolute
+DIE_AREA:  [0, 0, 4250, 6320]
+CORE_AREA: [20, 20, 4230, 6300]
+PL_TARGET_DENSITY_PCT: 30
+RUN_POST_GPL_DESIGN_REPAIR: false
+GRT_ALLOW_CONGESTION: true
+PDN_MACRO_CONNECTIONS:
+  - ".*u_sram VDD VSS VDD VSS"  
+PDN_CFG: dir::work/librelane/chip_core/pdn_cfg.tcl
+IGNORE_DISCONNECTED_MODULES:
+  - eFPGA_top
+KLAYOUT_DRC_OPTIONS:
+  feol: true
+  beol: true
+  dummy: true
+  dummy_no_sub_prev: true
+  offgrid: true
+  conn_drc: true
+  wedge: true
+  run_mode: deep
+  topcell: chip_core
+MACROS:
+  eFPGA_top:
+    gds: ["dir::work/ip/efpga/eFPGA_top.gds"]
+    lef: ["dir::work/ip/efpga/eFPGA_top.lef"]
+    nl:  ["dir::work/ip/efpga/eFPGA_top.bb.v"]
+    instances:
+      "u_cpu.xif_copro_i.xif_copro_verilog_i.efpga_i": {location: [1450, 75], orientation: N}
+  gf180mcu_fd_ip_sram__sram512x8m8wm1:
+    gds: ["dir::gf180mcu/gf180mcuD/libs.ref/gf180mcu_fd_ip_sram/gds/gf180mcu_fd_ip_sram__sram512x8m8wm1.gds"]
+    lef: ["dir::gf180mcu/gf180mcuD/libs.ref/gf180mcu_fd_ip_sram/lef/gf180mcu_fd_ip_sram__sram512x8m8wm1.lef"]
+    nl:  ["dir::gf180mcu/gf180mcuD/libs.ref/gf180mcu_fd_ip_sram/verilog/gf180mcu_fd_ip_sram__sram512x8m8wm1__blackbox.v"]
+    lib:
+      "*": ["dir::gf180mcu/gf180mcuD/libs.ref/gf180mcu_fd_ip_sram/lib/gf180mcu_fd_ip_sram__sram512x8m8wm1__tt_025C_5v00.lib"]
+    instances:
+      "u_mem.g_bank[0].g_lane[0].u_sram": {location: [100, 100],  orientation: N}
+      "u_mem.g_bank[0].g_lane[1].u_sram": {location: [600, 100],  orientation: N}
+      "u_mem.g_bank[0].g_lane[2].u_sram": {location: [100, 650],  orientation: N}
+      "u_mem.g_bank[0].g_lane[3].u_sram": {location: [600, 650],  orientation: N}
+      "u_mem.g_bank[1].g_lane[0].u_sram": {location: [100, 1200], orientation: N}
+      "u_mem.g_bank[1].g_lane[1].u_sram": {location: [600, 1200], orientation: N}
+      "u_mem.g_bank[1].g_lane[2].u_sram": {location: [100, 1750], orientation: N}
+      "u_mem.g_bank[1].g_lane[3].u_sram": {location: [600, 1750], orientation: N}
+      
+      
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+
+
+Run the full chip to GDS:
+
+term: cd /home/prasit/fabulous_self
+
+term:
+'''
+
+DEF=$(find /nix/store -path "*librelane*/scripts/openroad/common/pdn_cfg.tcl" 2>/dev/null | head -1)
+echo "default cfg: $DEF"
+install -m 644 "$DEF" work/librelane/chip_core/pdn_cfg.tcl      # writable copy
+cat >> work/librelane/chip_core/pdn_cfg.tcl <<'TCL'
+
+# gf180 SRAM power pins are on Metal2/Metal3; the default macro grid only connects
+# Metal4<->Metal5, so bridge the SRAM pins up to the Metal4 (vertical) straps.
+add_pdn_connect -grid macro -layers "Metal2 $::env(PDN_VERTICAL_LAYER)"
+add_pdn_connect -grid macro -layers "Metal3 $::env(PDN_VERTICAL_LAYER)"
+TCL
+
+'''
+
+In work/librelane/chip_core/config.yaml, keep the existing PDN_MACRO_CONNECTIONS block and add:
+
+PDN_CFG: dir::work/librelane/chip_core/pdn_cfg.tcl
+
+
+Now run in fabulous_self with below command:
+
+term:
+
+'''
+  
+nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+  librelane work/librelane/chip_core/config.yaml \
+  --pdk gf180mcuD --pdk-root $PWD/gf180mcu --manual-pdk \
+  --design-dir $PWD --run-tag chip_core_v3 \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+  
+'''
+
+This will generate runs/chip_core/final/gds/chip_core.gds  .  . This GDS is the complete greyhound-style chip: RISC-V CPU + eFPGA coprocessor + on-chip SRAM + SPI program loader, on gf180. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Currently eFPGA_top.gds, eFPGA_top.lef, eFPGA_top.bb.v are placeholders:
+It's the three files you made in Step 5, in work/ip/efpga/:
+
+File	          Size	                           What it really is
+eFPGA_top.gds	176 bytes	  just one empty rectangle — a box of the right outline, no transistors, no wires inside
+eFPGA_top.lef	93 KB	          the abstract: footprint + 590 boundary pins + "interior is blocked" (this part is real/usable)
+eFPGA_top.bb.v	448 B	          a (* blackbox *) module — ports only, no logic
+The chip flow places this empty box and routes to its pins, but there's nothing inside — that's why LVS can't check it, it has no power pins, and its pins have no antenna info. "Real hardening" = replacing that empty .gds with one that actually contains the 76 hardened tiles placed in a grid and the fabric interconnect routed.
+
+
+On the bigger machine (≥32 GB RAM)
+
+0. Get the tools working
+Same as on your laptop — if it has internet:
+term:
+cd fabulous_self
+nix develop "github:librelane/librelane/leo/gf180mcu" --command librelane --version
+
+1. Collect your 5 hardened tile macros into one place
+term:
+'''
+cd fabulous_self
+declare -A TG=( [LUT4AB]=lut4ab_v2 [CIO]=CIO_v1 [W_IO]=W_IO_v1 [N_term_single]=N_term_single_v2 [S_term_single]=S_term_single_v2 )
+for T in "${!TG[@]}"; do
+  mkdir -p work/ip/efpga/tiles/$T
+  cp runs/${TG[$T]}/final/gds/$T.gds work/ip/efpga/tiles/$T/
+  cp runs/${TG[$T]}/final/lef/$T.lef work/ip/efpga/tiles/$T/
+  cp runs/${TG[$T]}/final/nl/$T.nl.v work/ip/efpga/tiles/$T/
+done
+'''
+
+2. Create the placement generator work/gen_stitch.py (this is verified — places 76 tiles):
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+#!/usr/bin/env python3
+import re, sys, os, collections
+EFPGA_V, TILE_DIR, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
+def lef_size(t):
+    s=open(os.path.join(TILE_DIR,f"{t}.lef")).read()
+    m=re.search(r"SIZE\s+([\d.]+)\s+BY\s+([\d.]+)", s); return float(m.group(1)), float(m.group(2))
+TYPES=["LUT4AB","CIO","W_IO","N_term_single","S_term_single"]
+W={t:lef_size(t)[0] for t in TYPES}; H={t:lef_size(t)[1] for t in TYPES}
+grid={}
+for x,y,t in re.findall(r"Tile_X(\d+)Y(\d+)_(LUT4AB|CIO|W_IO|N_term_single|S_term_single)\b", open(EFPGA_V).read()):
+    grid[(int(x),int(y))]=t
+xs=sorted({k[0] for k in grid}); ys=sorted({k[1] for k in grid})
+GX=GY=80.0; MARGIN=150.0
+colw={c:max(W[grid[(c,r)]] for r in ys if (c,r) in grid) for c in xs}
+rowh={r:max(H[grid[(c,r)]] for c in xs if (c,r) in grid) for r in ys}
+colx={}; x=MARGIN
+for c in xs: colx[c]=x; x+=colw[c]+GX
+DIE_W=x-GX+MARGIN
+rowy={}; y=MARGIN
+for r in ys: rowy[r]=y; y+=rowh[r]+GY
+DIE_H=y-GY+MARGIN
+bytype=collections.defaultdict(list)
+for (c,r),t in grid.items(): bytype[t].append((f"eFPGA_inst.Tile_X{c}Y{r}_{t}", round(colx[c],2), round(rowy[r],2)))
+P="cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/fabric"; IP="work/ip/efpga/tiles"
+infra=["eFPGA_top","eFPGA","eFPGA_Config","ConfigFSM","Frame_Data_Reg","Frame_Select","config_UART","bitbang","models_pack"]
+L=["# eFPGA fabric stitch: 76 tile macros placed + routed -> real eFPGA_top.",
+   "DESIGN_NAME: eFPGA_top","VERILOG_FILES:"]
+for m in infra: L.append(f'  - "dir::{P}/{m}.v"')
+L+=['CLOCK_PORT: "CLK"','CLOCK_PERIOD: 40','FP_SIZING: absolute',
+    f"DIE_AREA: [0, 0, {DIE_W:.2f}, {DIE_H:.2f}]", f"CORE_AREA: [20, 20, {DIE_W-20:.2f}, {DIE_H-20:.2f}]",
+    "PL_TARGET_DENSITY_PCT: 25","ERROR_ON_SYNTH_CHECKS: false","RUN_LINTER: false","GRT_ALLOW_CONGESTION: true",
+    "RUN_POST_GPL_DESIGN_REPAIR: false","DESIGN_REPAIR_BUFFER_INPUT_PORTS: false","RUN_POST_GRT_DESIGN_REPAIR: false",
+    "RUN_CTS: false","RUN_POST_CTS_RESIZER_TIMING: false","FP_PDN_SKIPTRIM: true","PDN_CORE_RING: false","MACROS:"]
+for t in TYPES:
+    L+=[f"  {t}:", f'    gds: ["dir::{IP}/{t}/{t}.gds"]', f'    lef: ["dir::{IP}/{t}/{t}.lef"]',
+        f'    nl:  ["dir::{IP}/{t}/{t}.nl.v"]', "    instances:"]
+    for path,xx,yy in bytype[t]: L.append(f'      "{path}": {{location: [{xx}, {yy}], orientation: N}}')
+open(OUT,"w").write("\n".join(L)+"\n")
+print(f"placed {sum(len(v) for v in bytype.values())} tiles; DIE {DIE_W:.0f}x{DIE_H:.0f}")
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+Run it to produce the stitch config:
+
+term:
+'''
+mkdir -p work/librelane/efpga_stitch
+python3 work/gen_stitch.py \
+  cv32e40x_updated_with_coproc_working_verilog/rtl/efpga/fabric/eFPGA.v \
+  work/ip/efpga/tiles work/librelane/efpga_stitch/config.yaml
+'''
+
+4. Swap the real eFPGA views in over the placeholder
+term:
+'''
+cp runs/efpga_stitch/final/gds/eFPGA_top.gds work/ip/efpga/eFPGA_top.gds
+cp runs/efpga_stitch/final/lef/eFPGA_top.lef work/ip/efpga/eFPGA_top.lef
+cp runs/efpga_stitch/final/nl/eFPGA_top.nl.v  work/ip/efpga/eFPGA_top.nl.v
+'''
+Then in work/librelane/chip_core/config.yaml, point the eFPGA macro at the real netlist and add it to the power connections:
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+  eFPGA_top:
+    gds: ["dir::work/ip/efpga/eFPGA_top.gds"]
+    lef: ["dir::work/ip/efpga/eFPGA_top.lef"]
+    nl:  ["dir::work/ip/efpga/eFPGA_top.nl.v"]   # was eFPGA_top.bb.v -> now the REAL netlist
+    instances:
+      "u_cpu.xif_copro_i.xif_copro_verilog_i.efpga_i": {location: [1450, 75], orientation: N}
+
+PDN_MACRO_CONNECTIONS:
+  - ".*u_sram VDD VSS VDD VSS"
+  - "u_cpu.xif_copro_i.xif_copro_verilog_i.efpga_i VDD VSS VDD VSS"   # eFPGA now has real power pins
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+(Check the real eFPGA_top.lef for its actual power-pin names — likely VDD/VSS; adjust if different.)
+
+5. Re-run the chip — now with the real eFPGA → fully signoff-clean
+term:
+'''
+nix develop "github:librelane/librelane/leo/gf180mcu" --command \
+  librelane work/librelane/chip_core/config.yaml \
+  --pdk gf180mcuD --pdk-root $PWD/gf180mcu --manual-pdk \
+  --design-dir $PWD --run-tag chip_core_real \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+'''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+The errors are specifically:
+62-checker-xor: 112 xor difference found -deferred
+65-checker-magicdrc: 21466 Magic DRC errors found -deferred
+66-checker-klayoutdrc: 664 KLayout DRC errors found -deferred
+70-checker-lvs: 5 LVS errors found -deferred
+
+
+in checker xor,
+
+   Running XOR for layer 40/0
+'input' in:xor.drc:109
+   Polygons (raw): 278870 (flat) 194567 (hierarchical)
+   Elapsed:0.000s Memory: 2698.00M
+'input' in:xor.drc:109
+   Polygons (raw): 279046 (flat) 1164634 (hierarchical)
+   Elapsed:0.010s Memory: 2698.00M
+'^' in:xor.drc:109
+   Polygons (raw): 112 (flat) 112 (hierarchical)
+   Elapsed:9.060s Memory: 2698.00M
+XOR differences: 112
+"output" in xor.drc:86
+   Polygons(raw): 112 (flat) 112 (hierarchical)
+   Elapsed: 0.030s Memory: 2698.00M
+
+
+
+
+In KLayout DRC,
+M3.2a: 4
+V2.2b: 60
+V2.2a: 216
+V2.1: 384
+
+In magic drc,
+
+via2 width < 0.28u (V2.1+2*V2.3) : This layer can't abut or partially overlap between subcells
+via2 width < 0.24u (V2.2a - 2*V.3)
+Diffusion spacing < 0.36 (DF.3a)
+Diffusion minimum area < 0.2025um^2 (DF.9)
+M3 spacing <0.28u (M3.2a)
+both MV & LV deviation can't be in the same well (DV.9)
+N diffusion - spacing to N well < 0.05u (DF.8)
+N diffusion - overlap of contact < 00.65u (CO.4)
+N diffusion - overlap of contact to N well < 0.43u (DF.8)
+5/6V Diffusion spacing to 3.3 V tap < 0.48 u (DV.6 + DV.3)
+Count: 21466
+
+In LVS,
+Subcircuit summary:
+Circuit 1: chip_core   Circuit 2: chip_core 
+here, two column elements starting with gf180mcu_fd_sc_mcu7t5v0
+No. of nets: 22171  No. of nets 22172
+NET Mismatches: class fragments follow (with fanout count)
+...
+Subcircuit pins:
+Circuit 1      Circuit 2
+VSS            VDD (MISMATCH)
+spi_miso_o     fpga_miso_o (MISMATCH)
+fpga_miso_o    spi_miso_o (MISMATCH)
+
+Top level cell failed pin matching  
+
+
+Warning: Above errors are not copy pasted exactly, they are just written by hand just for debugging purposes
