@@ -26,3 +26,6 @@ endmodule
 
 
 //https://drive.google.com/file/d/1YSbUNlv7oaij2yelk9BAs4FvnTDfMaht/view?usp=sharing
+
+//VSIM_FLAGS              = -dpicpppath C:/Users/Prasit/mingw64/bin/gcc.exe "+rand_stall_obi_disable"
+
