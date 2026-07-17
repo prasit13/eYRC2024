@@ -1,0 +1,298 @@
+Step 1 is unchanged — to be clear about its intent: it backs up the old 640-bit tiles inside the IHP workspace (they contain the already-hardened macro/ views we may want for reference), before Step 2 overwrites those dirs with the dense sources from kf_wide_self:
+
+
+export WORK=/home/prasit/Downloads/a_kf_from_scratch/Librelane_Physical_Design_IHP_PDK
+source $WORK/offline_ihp_bundle/activate-ihp.sh
+librelane --version
+openroad -version
+cp -a $WORK/tiles $WORK/tiles_640bit_backup
+ls $WORK/tiles_640bit_backup
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+STEP 2 — Stage the densified kf_wide_self tile sources + set MaxFramesPerCol,32
+
+S=/home/prasit/Downloads/a_kf_from_scratch/kf_wide_self
+rsync -a --exclude 'gds_config.yaml' $S/Tile/ $WORK/tiles/
+sed -i '/MultiplexerStyle,custom/a MaxFramesPerCol,32' $WORK/fabric/fabric.csv
+
+# verify:
+grep MaxFramesPerCol $WORK/fabric/fabric.csv
+grep -m1 NoConfigBits $WORK/tiles/LUT4AB/LUT4AB.v
+grep -i matrix $WORK/tiles/LUT4AB/LUT4AB.csv
+echo "frames=$(($(wc -l < $WORK/tiles/LUT4AB/LUT4AB_ConfigMem.csv)-1))"
+ls $WORK/tiles/LUT4AB/config.yaml $WORK/tiles/LUT4AB/macro $WORK/tiles/models_pack.v
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+STEP 3 — Build the patched-plugin shim (MaxFramesPerCol=32 in the tile flow)
+
+mkdir -p $WORK/plugin_shim
+cp -r "$(python3 -c 'import librelane_plugin_fabulous as p, os; print(os.path.dirname(p.__file__))')" $WORK/plugin_shim/
+chmod -R u+w $WORK/plugin_shim/librelane_plugin_fabulous
+find $WORK/plugin_shim -name __pycache__ -type d -exec rm -rf {} +
+
+python3 - <<'EOF'
+import os, pathlib
+p = pathlib.Path(os.environ["WORK"]) / "fabulous_geomfix/fabulous/fabric_definition/fabric.py"
+s = p.read_text()
+if "maxFramesPerCol must be <= 32" in s:
+    print("already patched:", p)
+else:
+    old = '''        if self.maxFramesPerCol != 20:
+            raise ValueError(
+                "Due to bitstream limitations, maxFramesPerCol must be 20."
+            )'''
+    assert s.count(old) == 1, f"anchor found {s.count(old)} times"
+    new = '''        if self.maxFramesPerCol > 32:
+            raise ValueError(
+                "maxFramesPerCol must be <= 32 (encoded-frame bitstream header)."
+            )'''
+    p.write_text(s.replace(old, new))
+    print("patched:", p)
+EOF
+
+find $WORK/fabulous_geomfix -name __pycache__ -type d -exec rm -rf {} +
+export PYTHONPATH=$WORK/plugin_shim:$WORK/fabulous_geomfix
+
+# must print the geomfix path, NOT /nix/store:
+python3 -c "import fabulous; print('fabulous from:', fabulous.__file__)"
+grep -n "maxFramesPerCol > 32" $WORK/fabulous_geomfix/fabulous/fabric_definition/fabric.py
+
+rm -rf $WORK/tiles/LUT4AB/runs/wide874_h340
+cd $WORK/tiles/LUT4AB
+librelane config.yaml --pdk ihp-sg13g2 --pdk-root $PDK_ROOT --manual-pdk --run-tag wide874_h340 |& tee ll_wide874_h340.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+STEP 4c — Re-harden LUT4AB at height 446.04
+
+sed -i 's/DIE_AREA: \[0, 0, 219.84, 340.20\]/DIE_AREA: [0, 0, 219.84, 446.04]/' $WORK/tiles/LUT4AB/config.yaml
+grep DIE_AREA $WORK/tiles/LUT4AB/config.yaml
+
+rm -rf $WORK/tiles/LUT4AB/runs/wide874_h340   # reclaim space from the failed run
+cd $WORK/tiles/LUT4AB
+librelane config.yaml --pdk ihp-sg13g2 --pdk-root $PDK_ROOT --manual-pdk --run-tag wide874_h446 |& tee ll_wide874_h446.log
+
+
+
+
+S=/home/prasit/Downloads/a_kf_from_scratch/kf_wide_self
+for f in LUT4AB.v LUT4AB_switch_matrix.v LUT4AB_ConfigMem.v; do
+  diff -q $S/Tile/LUT4AB/$f $WORK/tiles/LUT4AB/$f && echo "$f OK" || echo "$f DIFFERS <-- tell me"
+done
+grep -E "GPL-0301|Utilization|DRC|LVS|Flow complete|ERROR" ll_wide874_h446.log | tail -20
+python3 -c "import json; m=json.load(open('$WORK/tiles/LUT4AB/macro/ihp-sg13g2/metrics.json')); print('die:', m['design__die__bbox'], 'util:', m['design__instance__utilization'])"
+
+
+
+
+
+
+
+
+
+
+
+
+STEP 5 — Archive the LUT4AB run, then re-harden QMUL (height 4 × 446.04 = 1784.16)
+
+# archive the finished run to the USB (final views stay in tiles/LUT4AB/macro/)
+mkdir -p "/media/prasit/HP USB20FD/kf_ihp_runs"
+mv $WORK/tiles/LUT4AB/runs/wide874_h446 "/media/prasit/HP USB20FD/kf_ihp_runs/LUT4AB_wide874_h446"
+
+# QMUL die: same width, height exactly 4 LUT4AB rows so the supertile abuts
+sed -i 's/DIE_AREA: \[0, 0, 219.84, 1118.88\]/DIE_AREA: [0, 0, 219.84, 1784.16]/' $WORK/tiles/QMUL/config.yaml
+grep DIE_AREA $WORK/tiles/QMUL/config.yaml
+
+cd $WORK/tiles/QMUL
+librelane config.yaml --pdk ihp-sg13g2 --pdk-root $PDK_ROOT --manual-pdk --run-tag wide536_h1784 |& tee ll_wide536_h1784.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+STEP 6 — Archive QMUL run, re-harden CIO_W (height 446.04) + all four terminators
+
+'''
+mv $WORK/tiles/QMUL/runs/wide536_h1784 "/media/prasit/HP USB20FD/kf_ihp_runs/QMUL_wide536_h1784"
+
+# CIO_W: same height as LUT4AB so the west-edge column abuts
+sed -i 's/DIE_AREA: \[0, 0, 68.64, 279.72\]/DIE_AREA: [0, 0, 68.64, 446.04]/' $WORK/tiles/CIO_W/config.yaml
+grep DIE_AREA $WORK/tiles/CIO_W/config.yaml
+
+# terminators keep their old sizes (219.84 x 56.70) - they only need the
+# 32-bit FrameStrobe pinout regeneration
+set -o pipefail
+for T in CIO_W N_term_single S_term_single N_term_QMUL S_term_QMUL; do
+  echo "=== $T ==="
+  cd $WORK/tiles/$T
+  librelane config.yaml --pdk ihp-sg13g2 --pdk-root $PDK_ROOT --manual-pdk --run-tag wide32f |& tee ll_wide32f.log || { echo "FAILED: $T"; break; }
+done
+'''
+
+
+
+
+
+
+
+
+
+
+
+
+STEP 7b — Shim out CheckMacroInstances, rerun the stitch:
+
+
+
+python3 - <<'EOF'
+import os, pathlib
+p = pathlib.Path(os.environ["WORK"]) / "plugin_shim/librelane_plugin_fabulous/fabulous_fabric.py"
+s = p.read_text()
+if "OpenROAD.CheckMacroInstances" in s:
+    print("already patched:", p)
+else:
+    old = '''        # Disable STA
+        ("OpenROAD.STA*", None),'''
+    assert s.count(old) == 1, f"anchor found {s.count(old)} times"
+    new = '''        # Disable STA
+        ("OpenROAD.STA*", None),
+        # Skip macro-instance sanity check: with ~916 tile instances its
+        # per-instance env exceeds the kernel 128KB exec limit (E2BIG);
+        # ManualMacroPlacement still errors on missing instances.
+        ("OpenROAD.CheckMacroInstances", None),'''
+    p.write_text(s.replace(old, new))
+    print("patched:", p)
+EOF
+find $WORK/plugin_shim -name __pycache__ -type d -exec rm -rf {} +
+
+rm -rf $WORK/fabric/runs/wide874_stitch
+cd $WORK/fabric
+librelane config.yaml --pdk ihp-sg13g2 --pdk-root $PDK_ROOT --manual-pdk --run-tag wide874_stitch |& tee ll_wide874_stitch.log
+
+
+
+
+STEP 7c — Waive the edge-danglers and resume the stitch
+
+cd $WORK/fabric
+grep -q IGNORE_DISCONNECTED_MODULES config.yaml || cat >> config.yaml <<'EOF'
+
+# All 1346 "disconnected" pins are intrinsic edge danglers, verified 2026-07-16:
+# 1344 west-going W*END inputs on east-edge column X31 (no east neighbor) +
+# 2 carry-chain Ci at the tops of the QMUL columns. Interior abutment is clean.
+IGNORE_DISCONNECTED_MODULES: [LUT4AB, N_term_QMUL]
+EOF
+tail -3 config.yaml
+
+# resume from the report step (steps 1-29 are cached in the run dir)
+librelane config.yaml --pdk ihp-sg13g2 --pdk-root $PDK_ROOT --manual-pdk --run-tag wide874_stitch --from Odb.ReportDisconnectedPins |& tee -a ll_wide874_stitch.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+python3 $WORK/sta_fmax/trace_path.py
+
+
+
+
+
+
+
+
+
+cd $WORK/sta_fmax
+python3 gen_sta.py
+bash out/run_all.sh
+python3 fmax_summary.py
+
+
+
